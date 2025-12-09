@@ -1,0 +1,315 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>3D Snake v7.0 – Rainstorm Edition</title>
+<style>
+body { margin:0; overflow:hidden; background:#000; }
+canvas { display:block; }
+#score,#highscore{
+  position:absolute;left:10px;font-family:monospace;text-shadow:0 0 8px #0f0;
+}
+#score{top:10px;font-size:22px;color:#0f0;}
+#highscore{top:40px;font-size:18px;color:#0ff;}
+#menu{
+  position:absolute;top:0;left:0;right:0;bottom:0;
+  background:radial-gradient(circle at center,#001020ee,#000);
+  color:#0ff;display:flex;flex-direction:column;justify-content:center;align-items:center;
+  font-family:monospace;text-align:center;z-index:10;
+}
+#menu h1{font-size:42px;color:#00ffff;text-shadow:0 0 20px #00ffff;margin:0;}
+#menu p{font-size:18px;margin:8px;color:#77ffff;}
+#menu.hidden{display:none;}
+#radar{
+  position:absolute;right:20px;bottom:20px;width:150px;height:150px;
+  border:2px solid #0ff;border-radius:50%;background:radial-gradient(circle at center,#002,#000);
+  box-shadow:0 0 15px #0ff;
+}
+#radar canvas{width:100%;height:100%;}
+</style>
+</head>
+<body>
+<div id="menu">
+  <h1>3D Snake v7.0 🌧️</h1>
+  <p>Use ⬆️⬇️⬅️➡️ to move</p>
+  <p>Press <b>SPACE</b> to Start / Pause</p>
+</div>
+
+<div id="score">Score: 0</div>
+<div id="highscore">Highscore: 0</div>
+<div id="radar"><canvas id="radarCanvas" width="150" height="150"></canvas></div>
+
+<script src="three.min.js"></script>
+<script src="OrbitControls.js"></script>
+
+<script>
+// === Scene Setup ===
+const scene = new THREE.Scene();
+scene.background = new THREE.Color(0x000010);
+scene.fog = new THREE.Fog(0x000000, 40, 100);
+
+// === Camera ===
+const camera = new THREE.PerspectiveCamera(70, innerWidth/innerHeight, 0.1, 1000);
+camera.position.set(0, 15, 25);
+
+// === Renderer ===
+const renderer = new THREE.WebGLRenderer({antialias:true});
+renderer.setSize(innerWidth, innerHeight);
+renderer.shadowMap.enabled = true;
+document.body.appendChild(renderer.domElement);
+
+const controls = new THREE.OrbitControls(camera, renderer.domElement);
+controls.enablePan = false;
+controls.enableDamping = true;
+controls.maxPolarAngle = Math.PI/2.2;
+
+// === Lights ===
+const hemiLight = new THREE.HemisphereLight(0x6688ff, 0x22ff22, 0.6);
+scene.add(hemiLight);
+const dirLight = new THREE.DirectionalLight(0xffffff, 1.2);
+dirLight.position.set(10,20,10);
+dirLight.castShadow = true;
+scene.add(dirLight);
+
+// === Textures ===
+const texLoader = new THREE.TextureLoader();
+const grassTex = texLoader.load("https://threejs.org/examples/textures/terrain/grasslight-big.jpg");
+grassTex.wrapS = grassTex.wrapT = THREE.RepeatWrapping;
+grassTex.repeat.set(8, 8);
+const brickTex = texLoader.load("https://threejs.org/examples/textures/brick_diffuse.jpg");
+brickTex.wrapS = brickTex.wrapT = THREE.RepeatWrapping;
+
+// === Floor ===
+const gridSize = 20;
+const floorMat = new THREE.MeshStandardMaterial({
+  map: grassTex,
+  roughness: 0.4,
+  metalness: 0.3,
+  envMapIntensity: 0.6
+});
+const floor = new THREE.Mesh(new THREE.PlaneGeometry(gridSize*2, gridSize*2), floorMat);
+floor.rotation.x = -Math.PI/2;
+floor.receiveShadow = true;
+scene.add(floor);
+
+// === Brick Walls ===
+function createWall(x, z, rot=false){
+  const h=2,t=0.8;
+  const geo=rot
+    ? new THREE.BoxGeometry(t,h,gridSize*2+t)
+    : new THREE.BoxGeometry(gridSize*2+t,h,t);
+  const mat=new THREE.MeshStandardMaterial({map:brickTex,roughness:0.8});
+  const wall=new THREE.Mesh(geo,mat);
+  wall.position.set(x,h/2,z);
+  wall.castShadow=true;
+  scene.add(wall);
+}
+createWall(20,0,true);
+createWall(-20,0,true);
+createWall(0,20,false);
+createWall(0,-20,false);
+
+// === Variables ===
+let snake=[],snakeSpeed=0.15,score=0;
+let highscore=localStorage.getItem("snake_highscore")||0;
+document.getElementById("highscore").innerText="Highscore: "+highscore;
+let currentDir=new THREE.Vector3(1,0,0),nextDir=currentDir.clone();
+let food=null,trailParticles=[],obstacles=[],paused=true,gameStarted=false;
+
+// === Rain System ===
+const rainCount = 1200;
+const rainGeo = new THREE.BufferGeometry();
+const rainPositions = new Float32Array(rainCount * 3);
+for (let i=0;i<rainCount;i++){
+  rainPositions[i*3+0] = (Math.random()-0.5)*gridSize*4;
+  rainPositions[i*3+1] = Math.random()*50 + 10;
+  rainPositions[i*3+2] = (Math.random()-0.5)*gridSize*4;
+}
+rainGeo.setAttribute("position", new THREE.BufferAttribute(rainPositions,3));
+const rainMat = new THREE.PointsMaterial({color:0x66ccff,size:0.1,transparent:true,opacity:0.8});
+const rain = new THREE.Points(rainGeo, rainMat);
+scene.add(rain);
+
+// === Audio ===
+let audioCtx, fxGain;
+function initAudio(){
+  audioCtx=new(window.AudioContext||window.webkitAudioContext)();
+  fxGain=audioCtx.createGain();fxGain.connect(audioCtx.destination);
+}
+function playFoodSound(){
+  const osc=audioCtx.createOscillator(),g=audioCtx.createGain();
+  osc.type='square';osc.frequency.value=600;
+  g.gain.setValueAtTime(0.3,audioCtx.currentTime);
+  g.gain.exponentialRampToValueAtTime(0.001,audioCtx.currentTime+0.3);
+  osc.connect(g).connect(fxGain);
+  osc.start();osc.stop(audioCtx.currentTime+0.3);
+}
+
+// === Snake ===
+function createSegment(pos,index=0){
+  const geo=new THREE.SphereGeometry(index===0?0.55:0.4,16,16);
+  const mat=new THREE.MeshStandardMaterial({
+    color:index===0?0x00aaff:0x00ff66,
+    emissive:index===0?0x00ccff:0x00ff33,
+    emissiveIntensity:index===0?1:0.6
+  });
+  const seg=new THREE.Mesh(geo,mat);
+  seg.position.copy(pos);
+  seg.castShadow=true;
+  scene.add(seg);
+  return seg;
+}
+function initSnake(){
+  for(let i=0;i<5;i++)
+    snake.push(createSegment(new THREE.Vector3(-i*0.8,0.4,0),i===0?0:1));
+}
+initSnake();
+
+// === Food ===
+function spawnFood(){
+  if(food)scene.remove(food);
+  const geo=new THREE.SphereGeometry(0.35,16,16);
+  const mat=new THREE.MeshStandardMaterial({color:0xff3333,emissive:0xff0000,emissiveIntensity:1});
+  food=new THREE.Mesh(geo,mat);
+  food.position.set(
+    THREE.MathUtils.randInt(-gridSize+2,gridSize-2),
+    0.35,
+    THREE.MathUtils.randInt(-gridSize+2,gridSize-2)
+  );
+  scene.add(food);
+}
+spawnFood();
+
+// === Obstacles ===
+function spawnObstacle(){
+  const geo=new THREE.BoxGeometry(1.5,1.5,1.5);
+  const mat=new THREE.MeshStandardMaterial({map:brickTex,roughness:0.8});
+  const obs=new THREE.Mesh(geo,mat);
+  obs.position.set(
+    THREE.MathUtils.randInt(-gridSize+3,gridSize-3),
+    0.8,
+    THREE.MathUtils.randInt(-gridSize+3,gridSize-3)
+  );
+  obs.castShadow=true;scene.add(obs);
+  obstacles.push(obs);
+  setTimeout(()=>{
+    scene.remove(obs);
+    obstacles=obstacles.filter(o=>o!==obs);
+  },10000);
+}
+
+// === Movement ===
+function moveSnake(){
+  currentDir.copy(nextDir);
+  const head=snake[0];
+  head.position.addScaledVector(currentDir,snakeSpeed);
+
+  for(let i=1;i<snake.length;i++)
+    snake[i].position.lerp(snake[i-1].position,0.4);
+
+  if(Math.abs(head.position.x)>gridSize||Math.abs(head.position.z)>gridSize)
+    return gameOver();
+
+  for(let i=5;i<snake.length;i++)
+    if(head.position.distanceTo(snake[i].position)<0.5)return gameOver();
+
+  for(const o of obstacles)
+    if(head.position.distanceTo(o.position)<1)return gameOver();
+
+  if(food && head.position.distanceTo(food.position)<0.6){
+    score+=10;
+    document.getElementById("score").innerText="Score: "+score;
+    snake.push(createSegment(snake[snake.length-1].position.clone(),1));
+    snakeSpeed+=0.01;
+    spawnFood();
+    playFoodSound();
+    if(Math.random()<0.6)spawnObstacle();
+  }
+
+  camera.position.lerp(new THREE.Vector3(head.position.x+10,head.position.y+15,head.position.z+20),0.1);
+  camera.lookAt(head.position);
+}
+
+// === Rain Animation ===
+function updateRain(){
+  const pos = rain.geometry.attributes.position.array;
+  for(let i=0;i<rainCount;i++){
+    pos[i*3+1] -= 0.7;
+    if(pos[i*3+1]<0){
+      pos[i*3+1] = Math.random()*50 + 20;
+    }
+  }
+  rain.geometry.attributes.position.needsUpdate = true;
+}
+
+// === Game Over ===
+function gameOver(){
+  if(score>highscore){localStorage.setItem("snake_highscore",score);highscore=score;}
+  document.getElementById("highscore").innerText="Highscore: "+highscore;
+  setTimeout(()=>location.reload(),1500);
+}
+
+// === Controls ===
+addEventListener('keydown', e=>{
+  if(e.code==='Space'){
+    if(!gameStarted){startGame();return;}
+    paused=!paused;document.getElementById("menu").classList.toggle("hidden",!paused);
+  }
+  if(paused)return;
+  switch(e.key){
+    case'ArrowUp':if(currentDir.z===0)nextDir.set(0,0,-1);break;
+    case'ArrowDown':if(currentDir.z===0)nextDir.set(0,0,1);break;
+    case'ArrowLeft':if(currentDir.x===0)nextDir.set(-1,0,0);break;
+    case'ArrowRight':if(currentDir.x===0)nextDir.set(1,0,0);break;
+  }
+});
+
+// === Start Game ===
+function startGame(){
+  gameStarted=true;paused=false;
+  document.getElementById("menu").classList.add("hidden");
+  initAudio();animate();
+}
+
+// === Radar ===
+const radar=document.getElementById("radarCanvas");
+const ctx=radar.getContext("2d");
+function drawRadar(){
+  ctx.clearRect(0,0,150,150);
+  ctx.save();ctx.translate(75,75);
+  ctx.strokeStyle="#0ff";ctx.beginPath();ctx.arc(0,0,70,0,Math.PI*2);ctx.stroke();
+
+  const scale=3,head=snake[0];
+  ctx.fillStyle="#0f0";
+  ctx.beginPath();ctx.arc(head.position.x*scale,head.position.z*scale,3,0,Math.PI*2);ctx.fill();
+  ctx.fillStyle="#090";
+  for(let i=1;i<snake.length;i++)
+    ctx.fillRect(snake[i].position.x*scale-1,snake[i].position.z*scale-1,2,2);
+  if(food){
+    ctx.fillStyle="#f00";
+    ctx.beginPath();ctx.arc(food.position.x*scale,food.position.z*scale,3,0,Math.PI*2);ctx.fill();
+  }
+  ctx.restore();
+}
+
+// === Animate ===
+function animate(){
+  if(!paused){
+    moveSnake();
+    updateRain();
+    controls.update();
+    renderer.render(scene,camera);
+    drawRadar();
+  }
+  requestAnimationFrame(animate);
+}
+
+// === Resize ===
+addEventListener('resize',()=>{
+  camera.aspect=innerWidth/innerHeight;
+  camera.updateProjectionMatrix();
+  renderer.setSize(innerWidth,innerHeight);
+});
+</script>
+</body>
+</html>
